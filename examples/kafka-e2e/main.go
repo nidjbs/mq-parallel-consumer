@@ -1,7 +1,7 @@
 // End-to-end test against a real Kafka broker (single partition).
 //
-//   docker compose -f examples/kafka-e2e/docker-compose.yaml up -d
-//   go run ./examples/kafka-e2e
+//	docker compose -f examples/kafka-e2e/docker-compose.yaml up -d
+//	go run ./examples/kafka-e2e
 //
 // Produces nMsgs to a fresh topic, consumes via the swimlane SDK, then
 // asserts: all messages consumed and per-key offset order preserved.
