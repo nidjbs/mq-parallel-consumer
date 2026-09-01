@@ -51,7 +51,7 @@ func (b *benchBackend) Commit(ctx context.Context, commits map[swimlane.TopicPar
 	return nil
 }
 
-func (b *benchBackend) Pause(parts []swimlane.TopicPartition) error { return nil }
+func (b *benchBackend) Pause(parts []swimlane.TopicPartition) error  { return nil }
 func (b *benchBackend) Resume(parts []swimlane.TopicPartition) error { return nil }
 func (b *benchBackend) Close(ctx context.Context) error              { return nil }
 
