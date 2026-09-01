@@ -16,7 +16,8 @@ func newLane(idx int, w *partitionWorker, size int) *lane {
 func (l *lane) run(ctx context.Context) {
 	for msg := range l.q {
 		l.w.handle(ctx, msg)
-		l.w.inflight.Done()
+		l.w.env.inflightTotal.Add(-1)
 		l.w.inflightCount.Add(-1)
+		l.w.inflight.Done()
 	}
 }

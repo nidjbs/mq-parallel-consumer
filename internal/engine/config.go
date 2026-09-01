@@ -21,10 +21,10 @@ type RetryPolicy struct {
 type Config struct {
 	Mode             Mode
 	Lanes            int           // KeyOrdered: lanes per partition
-	Concurrency      int           // Unordered: concurrency per partition
-	MaxInFlight      int           // per-partition in-flight cap; 0 = derived
+	Concurrency      int           // Unordered: per-partition concurrency; the hard in-flight cap in this mode
+	MaxInFlight      int           // per-partition in-flight soft target that triggers pause; 0 = derived. Hard memory bounds are the bounded lane queues (Lanes x QueueSize) in KeyOrdered and the Concurrency semaphore in Unordered.
 	QueueSize        int           // per-lane bounded queue depth
-	CommitInterval   time.Duration // 0 = commit on contiguous advance
+	CommitInterval   time.Duration // 0 = commit immediately when the contiguous base advances
 	PollTimeout      time.Duration
 	RebalanceTimeout time.Duration
 	Retry            RetryPolicy

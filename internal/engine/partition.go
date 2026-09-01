@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// workerEnv bundles consumer-shared plumbing handed to each partition worker.
+type workerEnv struct {
+	fatalCh       chan error
+	cancel        context.CancelFunc // cancels the consumer's work ctx on fatal
+	inflightTotal *atomic.Int64
+	counters      *counters
+}
+
 // partitionWorker owns one partition's lanes and offset tracker.
 type partitionWorker struct {
 	tp            TopicPartition
@@ -21,20 +29,20 @@ type partitionWorker struct {
 	inflight      sync.WaitGroup
 	inflightCount atomic.Int64
 	maxInFlight   int
-	fatalCh       chan error
+	env           *workerEnv
 	mu            sync.Mutex
 	closed        bool
 	pending       map[Offset]struct{} // routed but not yet completed
 }
 
-func newPartitionWorker(tp TopicPartition, cfg Config, fatalCh chan error) *partitionWorker {
+func newPartitionWorker(tp TopicPartition, cfg Config, env *workerEnv) *partitionWorker {
 	w := &partitionWorker{
 		tp:          tp,
 		mode:        cfg.Mode,
 		cfg:         cfg,
 		tracker:     newOffsetTracker(),
 		maxInFlight: cfg.MaxInFlight,
-		fatalCh:     fatalCh,
+		env:         env,
 		pending:     make(map[Offset]struct{}),
 	}
 	if cfg.Mode == Unordered {
@@ -96,6 +104,7 @@ func (w *partitionWorker) route(ctx context.Context, msg *Message) bool {
 			defer func() { <-w.sem }()
 			defer w.inflight.Done()
 			defer w.inflightCount.Add(-1)
+			defer w.env.inflightTotal.Add(-1)
 			w.handle(ctx, msg)
 		}()
 		return true
@@ -170,6 +179,7 @@ func (w *partitionWorker) handle(ctx context.Context, msg *Message) {
 	if ctx.Err() != nil {
 		return // shutdown/drain: leave offset uncommitted
 	}
+	w.env.counters.handlerErrors.Add(1)
 	w.reportFatal(fmt.Errorf("%w: %v", ErrHandlerFatal, err))
 }
 
@@ -181,14 +191,15 @@ func (w *partitionWorker) process(ctx context.Context, msg *Message) error {
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		lastErr = w.handler(ctx, msg)
+		lastErr = w.safeHandler(ctx, msg)
 		if lastErr == nil {
+			w.env.counters.processed.Add(1)
 			return nil
 		}
 		if attempt == maxAttempts-1 {
 			break
 		}
-		backoff := retryBackoff(w.cfg.Retry, attempt)
+		backoff := jitteredBackoff(retryBackoff(w.cfg.Retry, attempt))
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -196,10 +207,36 @@ func (w *partitionWorker) process(ctx context.Context, msg *Message) error {
 		}
 	}
 	if w.cfg.OnDiscard != nil {
-		w.cfg.OnDiscard(ctx, msg, lastErr)
+		if err := w.safeOnDiscard(ctx, msg, lastErr); err != nil {
+			return err
+		}
+		w.env.counters.discarded.Add(1)
 		return nil
 	}
 	return lastErr
+}
+
+// safeHandler runs the user handler and converts a panic into an error so a
+// single bad message cannot crash the process.
+func (w *partitionWorker) safeHandler(ctx context.Context, msg *Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("handler panic: %v", r)
+		}
+	}()
+	return w.handler(ctx, msg)
+}
+
+// safeOnDiscard runs the OnDiscard callback; a panic is returned as an error so
+// the offset stays uncommitted and the consumer shuts down fatally.
+func (w *partitionWorker) safeOnDiscard(ctx context.Context, msg *Message, handlerErr error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("OnDiscard panic: %v", r)
+		}
+	}()
+	w.cfg.OnDiscard(ctx, msg, handlerErr)
+	return nil
 }
 
 // forget removes an offset from the pending set.
@@ -209,11 +246,15 @@ func (w *partitionWorker) forget(o Offset) {
 	w.mu.Unlock()
 }
 
-// reportFatal delivers a fatal error to the poll loop (non-blocking).
+// reportFatal delivers a fatal error to the poll loop and cancels the work
+// context so a queue-blocked poll loop unwinds promptly.
 func (w *partitionWorker) reportFatal(err error) {
 	select {
-	case w.fatalCh <- err:
+	case w.env.fatalCh <- err:
 	default:
+	}
+	if w.env.cancel != nil {
+		w.env.cancel()
 	}
 }
 

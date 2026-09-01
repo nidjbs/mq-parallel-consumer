@@ -1,12 +1,43 @@
 package kafka
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"mq-parallel-consumer"
 )
+
+// commitResult must surface per-partition error codes, not just the transport
+// error.
+func TestCommitResult(t *testing.T) {
+	trans := errors.New("transport boom")
+	if err := commitResult(trans, nil); err != trans {
+		t.Fatalf("transport err = %v, want the transport error", err)
+	}
+	if err := commitResult(nil, nil); err != nil {
+		t.Fatalf("nil response = %v, want nil", err)
+	}
+	respErr := &kmsg.OffsetCommitResponse{
+		Topics: []kmsg.OffsetCommitResponseTopic{
+			{Partitions: []kmsg.OffsetCommitResponseTopicPartition{{ErrorCode: kerr.UnknownTopicOrPartition.Code}}},
+		},
+	}
+	if err := commitResult(nil, respErr); err == nil {
+		t.Fatal("expected per-partition error, got nil")
+	}
+	respOK := &kmsg.OffsetCommitResponse{
+		Topics: []kmsg.OffsetCommitResponseTopic{
+			{Partitions: []kmsg.OffsetCommitResponseTopicPartition{{ErrorCode: 0}}},
+		},
+	}
+	if err := commitResult(nil, respOK); err != nil {
+		t.Fatalf("zero error code = %v, want nil", err)
+	}
+}
 
 func TestToMessage(t *testing.T) {
 	r := &kgo.Record{

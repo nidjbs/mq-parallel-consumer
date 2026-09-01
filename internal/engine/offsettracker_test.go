@@ -59,3 +59,25 @@ func TestCompleteBeforeSeed(t *testing.T) {
 		t.Fatalf("base = %d, want 6", got)
 	}
 }
+
+// the commit baseline initializes at seed, so the first real advance is
+// recognized as an advance.
+func TestAdvancedSinceCommit(t *testing.T) {
+	tr := newOffsetTracker()
+	tr.seed(0)
+	if tr.advancedSinceCommit() {
+		t.Fatal("no advance expected right after seed")
+	}
+	tr.complete(0) // base -> 1
+	if !tr.advancedSinceCommit() {
+		t.Fatal("expected advance after first complete")
+	}
+	tr.markCommitted()
+	if tr.advancedSinceCommit() {
+		t.Fatal("baseline updated after commit, no advance expected")
+	}
+	tr.complete(1) // base -> 2
+	if !tr.advancedSinceCommit() {
+		t.Fatal("expected advance after second complete")
+	}
+}

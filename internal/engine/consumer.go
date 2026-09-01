@@ -21,6 +21,10 @@ type Consumer struct {
 	workCtx    context.Context
 	workCancel context.CancelFunc
 
+	runState     atomic.Bool // single-use guard: Run may only be called once
+	rebalanceErr error       // revoke commit failure, surfaced by Run
+	counters     *counters
+
 	inflightTotal atomic.Int64
 	fatalCh       chan error
 }
@@ -41,6 +45,7 @@ func New(backend Backend, cfg Config) (*Consumer, error) {
 		paused:  make(map[TopicPartition]bool),
 		stopCh:  make(chan struct{}),
 		fatalCh: make(chan error, 1),
+		counters: &counters{},
 	}, nil
 }
 
@@ -55,12 +60,18 @@ func (c *Consumer) Subscribe(topics []string, handler Handler) error {
 }
 
 // Run blocks until ctx is done, Stop is called, or a fatal error occurs.
+// A consumer is single-use: Run may be called at most once.
 func (c *Consumer) Run(ctx context.Context) error {
 	c.mu.Lock()
-	if c.handler == nil {
-		c.mu.Unlock()
+	noHandler := c.handler == nil
+	c.mu.Unlock()
+	if noHandler {
 		return fmt.Errorf("%w: Subscribe must be called before Run", ErrInvalidConfig)
 	}
+	if !c.runState.CompareAndSwap(false, true) {
+		return fmt.Errorf("%w: Run called more than once", ErrAlreadyRunning)
+	}
+	c.mu.Lock()
 	c.workCtx, c.workCancel = context.WithCancel(ctx)
 	c.mu.Unlock()
 
@@ -69,6 +80,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 	var lastCommit time.Time
 	first := true
 	for {
+		if rerr := c.takeRebalanceErr(); rerr != nil {
+			return c.shutdown(rerr)
+		}
 		select {
 		case <-ctx.Done():
 			return c.shutdown(nil)
@@ -79,10 +93,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 		default:
 		}
 
-		if c.cfg.CommitInterval <= 0 || first || time.Since(lastCommit) >= c.cfg.CommitInterval {
-			c.commitAll(c.workCtx)
-			lastCommit = time.Now()
-			first = false
+		if c.cfg.CommitInterval > 0 {
+			if first || time.Since(lastCommit) >= c.cfg.CommitInterval {
+				c.commitAll(c.workCtx, false)
+				lastCommit = time.Now()
+				first = false
+			}
+		} else {
+			c.commitAll(c.workCtx, true) // commit-on-advance
 		}
 
 		c.applyBackpressure(c.workCtx)
@@ -117,10 +135,15 @@ func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := Stats{
-		Mode:          c.cfg.Mode,
-		Partitions:    len(c.workers),
-		InFlightTotal: c.inflightTotal.Load(),
-		PerPartition:  make(map[TopicPartition]PartitionStat, len(c.workers)),
+		Mode:              c.cfg.Mode,
+		Partitions:        len(c.workers),
+		InFlightTotal:     c.inflightTotal.Load(),
+		PerPartition:      make(map[TopicPartition]PartitionStat, len(c.workers)),
+		MessagesProcessed: c.counters.processed.Load(),
+		MessagesDiscarded: c.counters.discarded.Load(),
+		HandlerErrors:     c.counters.handlerErrors.Load(),
+		Commits:           c.counters.commits.Load(),
+		CommitErrors:      c.counters.commitErrors.Load(),
 	}
 	for tp, w := range c.workers {
 		s.PerPartition[tp] = PartitionStat{
@@ -141,7 +164,12 @@ func (c *Consumer) OnAssigned(ctx context.Context, assigned map[TopicPartition]O
 		if _, ok := c.workers[tp]; ok {
 			continue
 		}
-		w := newPartitionWorker(tp, c.cfg, c.fatalCh)
+		w := newPartitionWorker(tp, c.cfg, &workerEnv{
+			fatalCh:       c.fatalCh,
+			cancel:        c.workCancel,
+			inflightTotal: &c.inflightTotal,
+			counters:      c.counters,
+		})
 		w.setHandler(c.handler)
 		w.start(c.workCtx)
 		c.workers[tp] = w
@@ -153,6 +181,7 @@ func (c *Consumer) OnRevoked(ctx context.Context, revoked []TopicPartition) erro
 	c.mu.Lock()
 	victims := make([]*partitionWorker, 0, len(revoked))
 	for _, tp := range revoked {
+		delete(c.paused, tp) // stale pause bookkeeping from an earlier assignment
 		if w, ok := c.workers[tp]; ok {
 			victims = append(victims, w)
 			delete(c.workers, tp)
@@ -160,8 +189,9 @@ func (c *Consumer) OnRevoked(ctx context.Context, revoked []TopicPartition) erro
 	}
 	c.mu.Unlock()
 
-	drainCtx, cancel := context.WithTimeout(ctx, c.cfg.RebalanceTimeout)
-	defer cancel()
+	// drain and final commit get independent budgets: a slow drain must not
+	// leave the commit with an already-expired context.
+	drainCtx, drainCancel := context.WithTimeout(ctx, c.cfg.RebalanceTimeout)
 	commits := make(map[TopicPartition]Offset)
 	for _, w := range victims {
 		w.drain(drainCtx)
@@ -169,10 +199,26 @@ func (c *Consumer) OnRevoked(ctx context.Context, revoked []TopicPartition) erro
 			commits[w.tp] = w.baseOffset()
 		}
 	}
+	drainCancel()
+	// best-effort: clear transport-level pause so a later reassignment of the
+	// same partition to this client does not start out paused.
+	if len(revoked) > 0 {
+		_ = c.backend.Resume(revoked)
+	}
 	if len(commits) == 0 {
 		return nil
 	}
-	return c.backend.Commit(drainCtx, commits)
+	commitCtx, commitCancel := context.WithTimeout(ctx, c.cfg.RebalanceTimeout)
+	defer commitCancel()
+	if err := c.backend.Commit(commitCtx, commits); err != nil {
+		c.mu.Lock()
+		if c.rebalanceErr == nil {
+			c.rebalanceErr = err
+		}
+		c.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // internals ------------------------------------------------------------------
@@ -190,20 +236,46 @@ func (c *Consumer) route(msg *Message) {
 	}
 }
 
-func (c *Consumer) commitAll(ctx context.Context) {
+// commitAll commits each seeded partition's base offset. With advanceOnly set
+// (commit-on-advance mode) a partition is skipped unless its base moved past
+// the last successful commit. Errors are non-fatal and retried next tick.
+func (c *Consumer) commitAll(ctx context.Context, advanceOnly bool) {
 	c.mu.Lock()
 	commits := make(map[TopicPartition]Offset, len(c.workers))
 	for tp, w := range c.workers {
-		if w.isSeeded() {
-			commits[tp] = w.baseOffset()
+		if !w.isSeeded() {
+			continue
 		}
+		if advanceOnly && !w.tracker.advancedSinceCommit() {
+			continue
+		}
+		commits[tp] = w.baseOffset()
 	}
 	c.mu.Unlock()
 	if len(commits) == 0 {
 		return
 	}
-	// v1: periodic commit errors are non-fatal, retried next tick
-	_ = c.backend.Commit(ctx, commits)
+	c.counters.commits.Add(1)
+	if err := c.backend.Commit(ctx, commits); err != nil {
+		c.counters.commitErrors.Add(1)
+		return
+	}
+	c.mu.Lock()
+	for tp := range commits {
+		if w, ok := c.workers[tp]; ok {
+			w.tracker.markCommitted()
+		}
+	}
+	c.mu.Unlock()
+}
+
+// takeRebalanceErr returns and clears a pending revoke-commit failure.
+func (c *Consumer) takeRebalanceErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.rebalanceErr
+	c.rebalanceErr = nil
+	return err
 }
 
 func (c *Consumer) applyBackpressure(ctx context.Context) {
@@ -229,15 +301,27 @@ func (c *Consumer) applyBackpressure(ctx context.Context) {
 }
 
 func (c *Consumer) shutdown(finalErr error) error {
+	// A work-context cancel can make Poll return context.Canceled before the
+	// poll loop reaches the fatalCh select; prefer a real fatal over a clean
+	// shutdown.
+	if finalErr == nil {
+		select {
+		case err := <-c.fatalCh:
+			finalErr = err
+		default:
+		}
+	}
 	c.mu.Lock()
 	workers := make([]*partitionWorker, 0, len(c.workers))
 	for _, w := range c.workers {
 		workers = append(workers, w)
 	}
+	if c.workCancel != nil {
+		c.workCancel()
+	}
 	c.mu.Unlock()
 
-	drainCtx, cancel := context.WithTimeout(context.Background(), c.cfg.RebalanceTimeout)
-	defer cancel()
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), c.cfg.RebalanceTimeout)
 	commits := make(map[TopicPartition]Offset)
 	for _, w := range workers {
 		w.drain(drainCtx)
@@ -245,12 +329,18 @@ func (c *Consumer) shutdown(finalErr error) error {
 			commits[w.tp] = w.baseOffset()
 		}
 	}
+	drainCancel()
 	if len(commits) > 0 {
-		if err := c.backend.Commit(drainCtx, commits); err != nil && finalErr == nil {
+		// fresh budget: a slow drain must not expire the final commit's context
+		commitCtx, commitCancel := context.WithTimeout(context.Background(), c.cfg.RebalanceTimeout)
+		defer commitCancel()
+		if err := c.backend.Commit(commitCtx, commits); err != nil && finalErr == nil {
 			finalErr = err
 		}
 	}
-	_ = c.backend.Close(drainCtx)
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), c.cfg.RebalanceTimeout)
+	defer closeCancel()
+	_ = c.backend.Close(closeCtx)
 	if finalErr != nil {
 		return finalErr
 	}

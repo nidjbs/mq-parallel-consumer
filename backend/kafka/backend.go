@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -12,19 +13,28 @@ import (
 	"mq-parallel-consumer"
 )
 
+const defaultMaxPollRecords = 500
+
 // Backend implements swimlane.Backend on top of franz-go.
 type Backend struct {
-	cli *kgo.Client
-	mu  sync.Mutex
-	h   swimlane.RebalanceHandler
+	cli            *kgo.Client
+	mu             sync.Mutex
+	h              swimlane.RebalanceHandler
+	maxPollRecords int
 }
 
 // New builds the franz-go client. Does not connect until Poll is called.
 func New(cfg Config) (*Backend, error) {
-	b := &Backend{}
+	b := &Backend{maxPollRecords: defaultMaxPollRecords}
+	if cfg.MaxPollRecords > 0 {
+		b.maxPollRecords = cfg.MaxPollRecords
+	}
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.DisableAutoCommit(), // SDK owns commit entirely
+	}
+	if cfg.FetchMaxBytes > 0 {
+		opts = append(opts, kgo.FetchMaxBytes(cfg.FetchMaxBytes))
 	}
 	if cfg.Group != "" {
 		opts = append(opts, kgo.ConsumerGroup(cfg.Group))
@@ -96,7 +106,7 @@ func (b *Backend) Subscribe(topics []string) error {
 func (b *Backend) Poll(ctx context.Context, maxWait time.Duration) ([]swimlane.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
-	fetches := b.cli.PollFetches(ctx)
+	fetches := b.cli.PollRecords(ctx, b.maxPollRecords)
 	if fetches.IsClientClosed() {
 		return nil, swimlane.ErrClosed
 	}
@@ -116,10 +126,30 @@ func (b *Backend) Poll(ctx context.Context, maxWait time.Duration) ([]swimlane.M
 
 func (b *Backend) Commit(ctx context.Context, commits map[swimlane.TopicPartition]swimlane.Offset) error {
 	var commitErr error
-	b.cli.CommitOffsetsSync(ctx, toFranzOffsets(commits), func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, _ *kmsg.OffsetCommitResponse, err error) {
-		commitErr = err
+	b.cli.CommitOffsetsSync(ctx, toFranzOffsets(commits), func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, err error) {
+		commitErr = commitResult(err, resp)
 	})
 	return commitErr
+}
+
+// commitResult reduces a commit response to a single error: the transport
+// error if present, otherwise the first non-zero per-partition error code.
+// A nil response with no transport error means success.
+func commitResult(err error, resp *kmsg.OffsetCommitResponse) error {
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return nil
+	}
+	for _, topic := range resp.Topics {
+		for _, partition := range topic.Partitions {
+			if perr := kerr.ErrorForCode(partition.ErrorCode); perr != nil {
+				return perr
+			}
+		}
+	}
+	return nil
 }
 
 func (b *Backend) Pause(parts []swimlane.TopicPartition) error {

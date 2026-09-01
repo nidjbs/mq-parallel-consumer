@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,12 +12,14 @@ import (
 
 // fakeBackend drives the engine deterministically without a real MQ.
 type fakeBackend struct {
-	mu      sync.Mutex
-	queue   []Message
-	commits []map[TopicPartition]Offset
-	paused  map[TopicPartition]bool
-	h       RebalanceHandler
-	closed  bool
+	mu          sync.Mutex
+	queue       []Message
+	commits     []map[TopicPartition]Offset
+	paused      map[TopicPartition]bool
+	resumeCalls []TopicPartition
+	commitErr   error // when set, Commit fails
+	h           RebalanceHandler
+	closed      bool
 }
 
 func (f *fakeBackend) SetRebalanceHandler(h RebalanceHandler) {
@@ -46,7 +50,7 @@ func (f *fakeBackend) Commit(ctx context.Context, commits map[TopicPartition]Off
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits = append(f.commits, commits)
-	return nil
+	return f.commitErr
 }
 func (f *fakeBackend) Pause(parts []TopicPartition) error {
 	f.mu.Lock()
@@ -59,6 +63,7 @@ func (f *fakeBackend) Pause(parts []TopicPartition) error {
 func (f *fakeBackend) Resume(parts []TopicPartition) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.resumeCalls = append(f.resumeCalls, parts...)
 	for _, p := range parts {
 		delete(f.paused, p)
 	}
@@ -254,5 +259,242 @@ func TestStats(t *testing.T) {
 	s := c.Stats()
 	if s.Mode != KeyOrdered {
 		t.Fatalf("stats mode = %v", s.Mode)
+	}
+}
+
+// Run may only be called once; a second call fails with ErrAlreadyRunning.
+func TestRunSingleUse(t *testing.T) {
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := c.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Run(ctx); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second Run error = %v, want ErrAlreadyRunning", err)
+	}
+}
+
+// CommitInterval=0 commits only when the contiguous base actually advances:
+// a message still in flight must not trigger a commit of the unadvanced base.
+func TestCommitOnAdvance(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	cfg.CommitInterval = 0 // commit-on-advance
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	handler := func(ctx context.Context, m *Message) error {
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	}
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	<-started // message in flight, base not yet advanced
+	// let the poll loop spin; advance-only must stay silent here.
+	time.Sleep(50 * time.Millisecond)
+	be.mu.Lock()
+	premature := len(be.commits)
+	be.mu.Unlock()
+	if premature != 0 {
+		t.Fatalf("committed before any advance: %v", be.commits)
+	}
+
+	close(release) // finish the message -> base advances to 1
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		committed := len(be.commits) > 0
+		be.mu.Unlock()
+		if committed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Stop()
+
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	if len(be.commits) == 0 {
+		t.Fatal("no commit after base advanced")
+	}
+	for _, cm := range be.commits {
+		if off := cm[tp]; off != 1 {
+			t.Fatalf("commit = %d, want only the advanced base 1", off)
+		}
+	}
+}
+
+// After all messages complete, the global in-flight counter returns to zero.
+func TestInflightTotalReturnsToZero(t *testing.T) {
+	be := newFakeBackend(
+		Message{Topic: "t", Partition: 0, Offset: 0, Key: []byte("a")},
+		Message{Topic: "t", Partition: 0, Offset: 1, Key: []byte("b")},
+	)
+	cfg := DefaultConfig()
+	cfg.Lanes = 2
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = c.Run(ctx)
+	if got := c.Stats().InFlightTotal; got != 0 {
+		t.Fatalf("InFlightTotal = %d, want 0", got)
+	}
+}
+
+// Revoke clears stale pause bookkeeping and resumes at the transport layer.
+func TestOnRevokedClearsPaused(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	go c.Run(ctx)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		h := be.h
+		be.mu.Unlock()
+		if h != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	be.mu.Lock()
+	h := be.h
+	be.mu.Unlock()
+	if h == nil {
+		t.Fatal("rebalance handler not registered")
+	}
+	c.mu.Lock()
+	c.paused[tp] = true // simulate applyBackpressure having paused
+	c.mu.Unlock()
+
+	if err := h.OnRevoked(context.Background(), []TopicPartition{tp}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	_, paused := c.paused[tp]
+	c.mu.Unlock()
+	if paused {
+		t.Fatal("paused bookkeeping not cleared on revoke")
+	}
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	found := false
+	for _, p := range be.resumeCalls {
+		if p == tp {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("transport Resume not called on revoke")
+	}
+	c.Stop()
+}
+
+// A failed final commit on revoke is surfaced by Run as a fatal error.
+func TestRevokeCommitErrorSurfacedByRun(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run(runCtx) }()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		h := be.h
+		be.mu.Unlock()
+		if h != nil && c.Stats().PerPartition[tp].BaseOffset >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	be.mu.Lock()
+	h := be.h
+	be.mu.Unlock()
+	if h == nil {
+		t.Fatal("rebalance handler not registered")
+	}
+	be.mu.Lock()
+	be.commitErr = errors.New("commit boom")
+	be.mu.Unlock()
+
+	if err := h.OnRevoked(context.Background(), []TopicPartition{tp}); err == nil {
+		t.Fatal("OnRevoked should return the commit error")
+	}
+	select {
+	case err := <-runErr:
+		if err == nil || !strings.Contains(err.Error(), "commit boom") {
+			t.Fatalf("Run error = %v, want commit boom surfaced", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not surface the revoke commit error")
+	}
+}
+
+// Stats counters reflect processed messages and commit attempts.
+func TestStatsCounters(t *testing.T) {
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = c.Run(ctx)
+	s := c.Stats()
+	if s.MessagesProcessed != 1 {
+		t.Fatalf("MessagesProcessed = %d, want 1", s.MessagesProcessed)
+	}
+	if s.Commits < 1 {
+		t.Fatalf("Commits = %d, want >= 1", s.Commits)
 	}
 }

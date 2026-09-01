@@ -6,10 +6,10 @@ An MQ-agnostic swim-lane concurrent consumer SDK. Within a single partition: **s
 
 - **Two ordering modes**: `KeyOrdered` / `Unordered`
 - **Contiguous offset commit**: only the contiguous run is committed under out-of-order completion; no loss on crash recovery
-- **Backpressure**: per-partition in-flight cap pause/resume + bounded queues
-- **Failure handling**: built-in backoff retry + `OnDiscard` callback; defaults to fatal on exhaustion
-- **Graceful rebalance**: drains in-flight messages and commits final offsets on revoke
-- **Thread-safe**: `New`/`Subscribe`/`Run`/`Stop`/`Stats`
+- **Backpressure**: per-partition in-flight soft cap pause/resume + bounded queues
+- **Failure handling**: built-in exponential + jitter backoff retry + `OnDiscard` callback; defaults to fatal on exhaustion; handler / `OnDiscard` panics are recovered into errors instead of crashing the process
+- **Graceful rebalance**: drains in-flight messages and commits final offsets on revoke; a failed final commit is surfaced as a fatal error by `Run()`
+- **Thread-safe**: `New`/`Subscribe`/`Run`/`Stop`/`Stats`; a `Consumer` is single-use (`Run` may be called at most once)
 
 ## How It Works
 
@@ -81,10 +81,10 @@ err = c.Run(ctx)
 |---|---|---|
 | `Mode` | `KeyOrdered` | Ordering mode |
 | `Lanes` | 8 | KeyOrdered lanes (concurrency per partition) |
-| `Concurrency` | 8 | Unordered concurrency |
-| `MaxInFlight` | concurrency × `QueueSize` | In-flight cap, triggers pause |
+| `Concurrency` | 8 | Unordered concurrency (hard in-flight cap in this mode) |
+| `MaxInFlight` | concurrency × `QueueSize` | In-flight soft cap triggering pause; hard memory bounds are the bounded lane queues (KeyOrdered) and the `Concurrency` semaphore (Unordered) |
 | `QueueSize` | 16 | Per-lane queue depth |
-| `CommitInterval` | 100ms | Commit window; `0` = commit on advance |
+| `CommitInterval` | 100ms | Commit window; `0` = commit immediately when the contiguous base advances |
 | `PollTimeout` | 100ms | Max block per poll |
 | `RebalanceTimeout` | 3s | Rebalance drain timeout |
 | `Retry` | zero = no retry | Backoff retry policy |
@@ -99,6 +99,19 @@ handler returns error
   ├─ exhausted && OnDiscard != nil → call OnDiscard, skip, advance offset
   └─ exhausted && OnDiscard == nil → fatal: offset not committed, Run() returns error
 ```
+
+A panic in the handler is treated like a handler error (retry → fatal); a panic
+in `OnDiscard` is fatal and leaves the offset uncommitted.
+
+## Kafka Adapter
+
+`backend/kafka.Config` adds transport-side memory bounds on top of the engine
+knobs:
+
+| Field | Default | Description |
+|---|---|---|
+| `MaxPollRecords` | 500 | Caps records returned per `Poll`; bounds single-batch in-flight memory |
+| `FetchMaxBytes` | franz-go default | Caps bytes fetched per broker round trip |
 
 ## Supporting Other MQs
 

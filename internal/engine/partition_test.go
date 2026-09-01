@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,8 +19,12 @@ func newTestConfig() Config {
 
 // newTestWorker builds a worker with the given handler and starts it.
 func newTestWorker(cfg Config, h Handler) *partitionWorker {
-	fatalCh := make(chan error, 1)
-	w := newPartitionWorker(TopicPartition{Topic: "t", Partition: 0}, cfg, fatalCh)
+	env := &workerEnv{
+		fatalCh:       make(chan error, 1),
+		inflightTotal: new(atomic.Int64),
+		counters:      new(counters),
+	}
+	w := newPartitionWorker(TopicPartition{Topic: "t", Partition: 0}, cfg, env)
 	w.setHandler(h)
 	w.start(context.Background())
 	return w
@@ -132,7 +138,7 @@ func TestRetryExhaustedFatal(t *testing.T) {
 		t.Fatalf("base = %d, want 0 (uncommitted)", got)
 	}
 	select {
-	case <-w.fatalCh:
+	case <-w.env.fatalCh:
 	default:
 		t.Fatal("expected fatal error")
 	}
@@ -178,4 +184,47 @@ func TestDrainIdempotent(t *testing.T) {
 	w.route(context.Background(), &Message{Offset: 0})
 	w.drain(context.Background())
 	w.drain(context.Background())
+}
+
+// a panic in the handler becomes a fatal error instead of crashing the process.
+func TestHandlerPanicBecomesFatal(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Retry = RetryPolicy{MaxAttempts: 1}
+	w := newTestWorker(cfg, func(ctx context.Context, m *Message) error { panic("boom") })
+	w.route(context.Background(), &Message{Offset: 0})
+	w.drain(context.Background())
+
+	select {
+	case err := <-w.env.fatalCh:
+		if !strings.Contains(err.Error(), "handler panic") {
+			t.Fatalf("fatal = %v, want handler panic", err)
+		}
+	default:
+		t.Fatal("expected fatal error from handler panic")
+	}
+	if got := w.baseOffset(); got != 0 {
+		t.Fatalf("base = %d, want 0 (uncommitted)", got)
+	}
+}
+
+// a panic in OnDiscard is fatal and leaves the offset uncommitted.
+func TestOnDiscardPanicFatal(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Retry = RetryPolicy{MaxAttempts: 1}
+	cfg.OnDiscard = func(ctx context.Context, m *Message, err error) { panic("discard boom") }
+	w := newTestWorker(cfg, func(ctx context.Context, m *Message) error { return errors.New("fail") })
+	w.route(context.Background(), &Message{Offset: 0})
+	w.drain(context.Background())
+
+	select {
+	case err := <-w.env.fatalCh:
+		if !strings.Contains(err.Error(), "OnDiscard panic") {
+			t.Fatalf("fatal = %v, want OnDiscard panic", err)
+		}
+	default:
+		t.Fatal("expected fatal error from OnDiscard panic")
+	}
+	if got := w.baseOffset(); got != 0 {
+		t.Fatalf("base = %d, want 0 (uncommitted)", got)
+	}
 }
