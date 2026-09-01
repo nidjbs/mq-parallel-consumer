@@ -122,6 +122,18 @@ handler returns error
 A panic in the handler is treated like a handler error (retry → fatal); a panic
 in `OnDiscard` is fatal and leaves the offset uncommitted.
 
+## Observability
+
+`Stats()` returns a point-in-time snapshot plus cumulative counters:
+
+| Field | Meaning |
+|---|---|
+| `InFlightTotal`, `PerPartition` | in-flight messages now (global + per partition) |
+| `MessagesProcessed` | handler completions |
+| `MessagesDiscarded` | messages skipped via `OnDiscard` |
+| `HandlerErrors` | fatal handler errors surfaced by `Run()` |
+| `Commits`, `CommitErrors` | offset commit attempts / failures |
+
 ## Kafka Adapter
 
 `backend/kafka.Config` adds transport-side memory bounds on top of the engine
