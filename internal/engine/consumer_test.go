@@ -18,6 +18,7 @@ type fakeBackend struct {
 	paused      map[TopicPartition]bool
 	resumeCalls []TopicPartition
 	commitErr   error // when set, Commit fails
+	idleErr     error // when set, empty Poll returns this instead of nil (e.g. DeadlineExceeded)
 	h           RebalanceHandler
 	closed      bool
 }
@@ -40,7 +41,7 @@ func (f *fakeBackend) Poll(ctx context.Context, maxWait time.Duration) ([]Messag
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.queue) == 0 {
-		return nil, nil
+		return nil, f.idleErr
 	}
 	batch := f.queue
 	f.queue = nil
@@ -473,6 +474,45 @@ func TestRevokeCommitErrorSurfacedByRun(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not surface the revoke commit error")
+	}
+}
+
+// An idle poll surfacing context.DeadlineExceeded (as franz-go does) must not
+// stop the consumer; it keeps looping until Stop().
+func TestIdlePollDeadlineKeepsRunning(t *testing.T) {
+	be := newFakeBackend(
+		Message{Topic: "t", Partition: 0, Offset: 0},
+		Message{Topic: "t", Partition: 0, Offset: 1},
+	)
+	be.idleErr = context.DeadlineExceeded // idle polls surface a fake deadline
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.Stats().MessagesProcessed < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("messages not consumed: processed=%d", c.Stats().MessagesProcessed)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Stop()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run error = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after Stop()")
 	}
 }
 

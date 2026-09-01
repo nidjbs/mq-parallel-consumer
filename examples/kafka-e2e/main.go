@@ -1,17 +1,20 @@
 // End-to-end test against a real Kafka broker (single partition).
 //
 //	docker compose -f examples/kafka-e2e/docker-compose.yaml up -d
-//	go run ./examples/kafka-e2e
+//	go run ./examples/kafka-e2e [-msgs 20000 -lanes 8 -io 1 -keys 2000]
 //
 // Produces nMsgs to a fresh topic, consumes via the swimlane SDK, then
 // asserts: all messages consumed and per-key offset order preserved.
+// Flags allow large-message concurrency-scaling runs on a real broker.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,11 +27,14 @@ import (
 	"mq-parallel-consumer/backend/kafka"
 )
 
-const (
-	brokers = "localhost:9092"
-	nMsgs   = 500
-	nKeys   = 10
-	ioSleep = time.Millisecond
+const brokers = "localhost:9092"
+
+var (
+	msgs   = flag.Int("msgs", 500, "number of messages to produce")
+	lanes  = flag.Int("lanes", 8, "number of lanes")
+	ioMS   = flag.Int("io", 1, "handler IO sleep in ms (IO-bound simulation)")
+	keys   = flag.Int("keys", 0, "distinct keys; 0 = derive (max(10, msgs/10))")
+	rounds = flag.Int("rounds", 1, "repetitions; prints per-round and median")
 )
 
 func waitForKafka(ctx context.Context) error {
@@ -83,7 +89,7 @@ func createTopic(ctx context.Context, topic string) error {
 	return lastErr
 }
 
-func produce(ctx context.Context, topic string) {
+func produce(ctx context.Context, topic string, nMsgs, nKeys int) {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers), kgo.DefaultProduceTopic(topic))
 	if err != nil {
 		log.Fatal(err)
@@ -105,18 +111,47 @@ func produce(ctx context.Context, topic string) {
 }
 
 func main() {
+	flag.Parse()
+	nMsgs := *msgs
+	nKeys := *keys
+	if nKeys <= 0 {
+		nKeys = max(10, nMsgs/10) // enough keys to spread across lanes
+	}
+	ioSleep := time.Duration(*ioMS) * time.Millisecond
+
 	ctx := context.Background()
 	if err := waitForKafka(ctx); err != nil {
 		log.Fatal(err)
 	}
 
+	throughputs := make([]float64, 0, *rounds)
+	for r := 1; r <= *rounds; r++ {
+		elapsed, nKeysGot, ordered, consumed := runOnce(ctx, nMsgs, nKeys, ioSleep)
+		throughput := float64(nMsgs) / elapsed.Seconds()
+		throughputs = append(throughputs, throughput)
+		fmt.Printf("round=%d lanes=%d consumed=%d keys=%d per-key-ordered=%v elapsed=%s throughput=%.0f msg/s\n",
+			r, *lanes, consumed, nKeysGot, ordered, elapsed.Round(time.Millisecond), throughput)
+		if consumed != int64(nMsgs) || !ordered {
+			os.Exit(1)
+		}
+	}
+	if *rounds > 1 {
+		sort.Float64s(throughputs)
+		med := throughputs[len(throughputs)/2]
+		fmt.Printf("lanes=%d median throughput=%.0f msg/s (%d rounds)\n", *lanes, med, *rounds)
+	}
+}
+
+// runOnce produces and consumes nMsgs on a fresh single-partition topic and
+// returns the consume elapsed time, distinct keys, ordering result, and count.
+func runOnce(ctx context.Context, nMsgs, nKeys int, ioSleep time.Duration) (time.Duration, int, bool, int64) {
 	// unique topic + group per run: a fresh consumer group avoids waiting for a
 	// previous run's member session to expire before the rebalance completes.
 	topic := fmt.Sprintf("swimlane-e2e-%d", time.Now().UnixNano())
 	if err := createTopic(ctx, topic); err != nil {
 		log.Fatal(err)
 	}
-	produce(ctx, topic)
+	produce(ctx, topic, nMsgs, nKeys)
 
 	var (
 		mu    sync.Mutex
@@ -137,7 +172,7 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg := swimlane.DefaultConfig()
-	cfg.Lanes = 8
+	cfg.Lanes = *lanes
 	cfg.PollTimeout = 500 * time.Millisecond
 	cfg.RebalanceTimeout = 5 * time.Second
 	c, err := swimlane.New(be, cfg)
@@ -150,11 +185,17 @@ func main() {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	runErr := make(chan error, 1)
 	start := time.Now()
-	go c.Run(runCtx)
+	go func() { runErr <- c.Run(runCtx) }()
 
-	deadline := time.Now().Add(60 * time.Second)
-	for count.Load() != nMsgs {
+	deadline := time.Now().Add(120 * time.Second)
+	for count.Load() != int64(nMsgs) {
+		select {
+		case err := <-runErr:
+			log.Fatalf("Run returned early: %v", err)
+		default:
+		}
 		if time.Now().After(deadline) {
 			log.Fatalf("timeout: consumed %d/%d", count.Load(), nMsgs)
 		}
@@ -173,11 +214,7 @@ func main() {
 			}
 		}
 	}
+	nKeysGot := len(got)
 	mu.Unlock()
-
-	fmt.Printf("consumed=%d keys=%d per-key-ordered=%v elapsed=%s throughput=%.0f msg/s\n",
-		count.Load(), len(got), ordered, elapsed.Round(time.Millisecond), float64(nMsgs)/elapsed.Seconds())
-	if count.Load() != nMsgs || !ordered {
-		os.Exit(1)
-	}
+	return elapsed, nKeysGot, ordered, count.Load()
 }

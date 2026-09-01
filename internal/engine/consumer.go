@@ -39,12 +39,12 @@ func New(backend Backend, cfg Config) (*Consumer, error) {
 		return nil, err
 	}
 	return &Consumer{
-		backend: backend,
-		cfg:     cfg,
-		workers: make(map[TopicPartition]*partitionWorker),
-		paused:  make(map[TopicPartition]bool),
-		stopCh:  make(chan struct{}),
-		fatalCh: make(chan error, 1),
+		backend:  backend,
+		cfg:      cfg,
+		workers:  make(map[TopicPartition]*partitionWorker),
+		paused:   make(map[TopicPartition]bool),
+		stopCh:   make(chan struct{}),
+		fatalCh:  make(chan error, 1),
 		counters: &counters{},
 	}, nil
 }
@@ -107,7 +107,13 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		msgs, err := c.backend.Poll(c.workCtx, c.cfg.PollTimeout)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, context.Canceled) {
+				return c.shutdown(nil)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				if c.workCtx.Err() == nil {
+					continue // poll window elapsed with nothing to consume; backend healthy
+				}
 				return c.shutdown(nil)
 			}
 			return c.shutdown(err)

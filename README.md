@@ -46,6 +46,8 @@ One poll loop fetches messages and routes them by key hash to a fixed set of lan
 
 ## Performance
 
+### In-memory engine (`go run ./bench`)
+
 IO-bound handler (1ms block) + 2000 messages, measured via `go run ./bench`:
 
 ```
@@ -58,7 +60,24 @@ swimlane L=16          150ms        13311    15.6x
 swimlane L=32           77ms        26001    30.5x
 ```
 
-Near-linear scaling (requires evenly distributed keys + IO-bound handler).
+### Real Kafka (single partition, `examples/kafka-e2e`)
+
+20k messages, 1ms IO handler, 2000 keys, median of 3 rounds, plus a raw
+franz-go sequential baseline (`examples/baseline`, no SDK):
+
+```
+config              msg/s   speedup (vs raw baseline)
+raw sequential       772     1.0x
+swimlane L=1         738     1.0x
+swimlane L=4        3109     4.0x
+swimlane L=8        6154     8.0x
+swimlane L=16      12171    15.8x
+```
+
+`Lanes=1` matches the raw sequential baseline (no overhead from the swim
+lanes), and throughput scales near-linearly with `Lanes`. Requires evenly
+distributed keys + an IO-bound handler; real-world speedups plateau when the
+single-partition broker fetch becomes the bottleneck.
 
 ## Quick Start
 
@@ -122,6 +141,7 @@ Implement the `Backend` SPI (`backend.go`): `Poll`/`Commit`/`Pause`/`Resume`/`Su
 ```bash
 go test ./... -race                                      # engine tests (in-memory backend, no MQ)
 docker compose -f examples/kafka-e2e/docker-compose.yaml up -d
-go run ./examples/kafka-e2e                            # real Kafka end-to-end (with assertions)
-go run ./bench                                         # concurrency benchmark
+go run ./examples/kafka-e2e [-msgs 20000 -lanes 8 -io 1 -keys 2000 -rounds 3]  # real Kafka e2e + scale runs
+go run ./examples/baseline [-msgs 20000 -io 1 -keys 2000]   # raw franz-go sequential baseline (no SDK)
+go run ./bench                                         # in-memory concurrency benchmark
 ```

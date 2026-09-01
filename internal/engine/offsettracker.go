@@ -5,12 +5,12 @@ import "sync"
 // offsetTracker tracks completed offsets and advances a contiguous commit
 // pointer. safe for concurrent use.
 type offsetTracker struct {
-	mu           sync.Mutex
-	hasBase      bool
-	done         map[Offset]struct{} // completed but not yet past the contiguous run
-	base         Offset              // next offset to commit; contiguous done = base-1
-	baseline     Offset              // base at last successful commit (or at seed)
-	baselineSet  bool
+	mu          sync.Mutex
+	hasBase     bool
+	done        map[Offset]struct{} // completed but not yet past the contiguous run
+	base        Offset              // next offset to commit; contiguous done = base-1
+	baseline    Offset              // base at last successful commit (or at seed)
+	baselineSet bool
 }
 
 func newOffsetTracker() *offsetTracker {

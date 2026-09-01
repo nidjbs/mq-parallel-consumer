@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -119,6 +120,12 @@ func (b *Backend) Poll(ctx context.Context, maxWait time.Duration) ([]swimlane.M
 		}
 	})
 	if errs := fetches.Errors(); len(errs) > 0 {
+		// a fetch that hits the poll window with nothing buffered is normal:
+		// franz-go injects context.DeadlineExceeded to break out of an idle
+		// poll, which must NOT stop the consumer.
+		if errors.Is(errs[0].Err, context.DeadlineExceeded) {
+			return msgs, nil
+		}
 		return msgs, errs[0].Err
 	}
 	return msgs, nil
