@@ -1,51 +1,52 @@
 # mq-parallel-consumer
 
-MQ 无关的泳道并发消费 SDK：单 partition 内**同 key 串行、异 key 并发**，offset 按**最大连续已完成**位置提交。核心零外部依赖，经 `Backend` SPI 适配 MQ，内置 Kafka（franz-go）。
+An MQ-agnostic swim-lane concurrent consumer SDK. Within a single partition: **same key serial, different keys concurrent**; offsets committed at the **max contiguous completed** position. The core has zero external dependencies and adapts to MQs via the `Backend` SPI, with Kafka (franz-go) built in.
 
-## 能力
+## Features
 
-- **两种顺序模式**：`KeyOrdered` / `Unordered`
-- **最大连续 offset 提交**：并发乱序完成下只提交连续区间，崩溃恢复零丢失
-- **背压**：单 partition 在途上限 pause/resume + 有界队列
-- **失败处理**：内置退避重试 + `OnDiscard` 回调；默认失败即致命上报
-- **rebalance 优雅收尾**：revoked 时 drain 在途并提交最终 offset
-- **线程安全**：`New`/`Subscribe`/`Run`/`Stop`/`Stats`
+- **Two ordering modes**: `KeyOrdered` / `Unordered`
+- **Contiguous offset commit**: only the contiguous run is committed under out-of-order completion; no loss on crash recovery
+- **Backpressure**: per-partition in-flight cap pause/resume + bounded queues
+- **Failure handling**: built-in backoff retry + `OnDiscard` callback; defaults to fatal on exhaustion
+- **Graceful rebalance**: drains in-flight messages and commits final offsets on revoke
+- **Thread-safe**: `New`/`Subscribe`/`Run`/`Stop`/`Stats`
 
-## 原理
+## How It Works
 
-一个 poll 循环拉取，按 key 哈希路由到固定泳道；同 key 恒落同一泳道（串行），异 key 跨泳道并发；完成即推进连续指针。
+One poll loop fetches messages and routes them by key hash to a fixed set of lanes. The same key always lands on the same lane (serial); different keys run concurrently across lanes. Completed offsets advance a contiguous pointer.
 
 ```
                     ┌────────────────────────────────────┐
-                    │        poll 循环（单 goroutine）      │
-                    │   Backend.Poll() 拉取一批消息          │
-                    │   按 key 哈希 → 路由到泳道             │
-                    │   定期提交「最大连续 offset」          │
+                    │        poll loop (single goroutine) │
+                    │   Backend.Poll() fetches a batch     │
+                    │   key hash → route to lane           │
+                    │   periodically commit max contiguous │
                     └─────────────────┬──────────────────┘
                                       │
         ┌─────────────────────────────┼─────────────────────────────┐
         ▼                             ▼                             ▼
   ┌────────────┐                ┌────────────┐              ┌────────────┐
-  │  泳道 0     │                │  泳道 1     │    ···      │  泳道 N-1   │
+  │  lane 0     │                │  lane 1     │    ···      │  lane N-1   │
   │ q→worker0  │                │ q→worker1  │              │ q→workerN  │
-  │ 同 key 串行 │                │ 同 key 串行 │              │ 同 key 串行 │
+  │ same key   │                │ same key   │              │ same key   │
+  │  serial    │                │  serial    │              │  serial    │
   └─────┬──────┘                └─────┬──────┘              └─────┬──────┘
         │                             │                           │
         └───────────────┬─────────────┴─────────────┬─────────────┘
                         ▼                           ▼
              ┌───────────────────────────────────────────────┐
-             │        offsetTracker（每 partition 一个）       │
-             │  完成 → complete(offset)，向前扫描推进连续指针     │
-             │  base = 最大连续已完成 + 1                      │
+             │       offsetTracker (one per partition)        │
+             │  done → complete(offset), scan forward pointer  │
+             │  base = max contiguous completed + 1            │
              └───────────────────┬───────────────────────────┘
                                  ▼
-                    Commit(base)：值为「下一个待消费 offset」
-                    崩溃恢复从 base 继续，at-least-once 零丢失
+                 Commit(base): value = "next offset to consume"
+                 crash recovery resumes at base, zero loss
 ```
 
-## 性能
+## Performance
 
-IO 密集 handler（阻塞 1ms）+ 2000 条消息，`go run ./bench` 实测：
+IO-bound handler (1ms block) + 2000 messages, measured via `go run ./bench`:
 
 ```
 config                elapsed        msg/s  speedup
@@ -57,9 +58,9 @@ swimlane L=16          150ms        13311    15.6x
 swimlane L=32           77ms        26001    30.5x
 ```
 
-近线性扩展（前提：key 均匀、IO 密集）。
+Near-linear scaling (requires evenly distributed keys + IO-bound handler).
 
-## 快速开始
+## Quick Start
 
 ```go
 cfg := swimlane.DefaultConfig()
@@ -74,40 +75,40 @@ c.Subscribe([]string{"demo-topic"}, func(ctx context.Context, msg *swimlane.Mess
 err = c.Run(ctx)
 ```
 
-## 配置
+## Configuration
 
-| 字段 | 默认值 | 说明 |
+| Field | Default | Description |
 |---|---|---|
-| `Mode` | `KeyOrdered` | 顺序模式 |
-| `Lanes` | 8 | KeyOrdered 泳道数（单 partition 并发度） |
-| `Concurrency` | 8 | Unordered 并发数 |
-| `MaxInFlight` | 并发度 × `QueueSize` | 在途上限，触发 pause |
-| `QueueSize` | 16 | 单泳道队列深度 |
-| `CommitInterval` | 100ms | 提交窗口；`0` = 推进即提交 |
-| `PollTimeout` | 100ms | 单次 poll 最长阻塞 |
-| `RebalanceTimeout` | 3s | rebalance 收尾超时 |
-| `Retry` | 零值=不重试 | 退避重试策略 |
-| `OnDiscard` | nil=失败即致命 | 重试耗尽回调 |
-| `KeyExtractor` | nil=用 msg.Key | 自定义路由 key |
+| `Mode` | `KeyOrdered` | Ordering mode |
+| `Lanes` | 8 | KeyOrdered lanes (concurrency per partition) |
+| `Concurrency` | 8 | Unordered concurrency |
+| `MaxInFlight` | concurrency × `QueueSize` | In-flight cap, triggers pause |
+| `QueueSize` | 16 | Per-lane queue depth |
+| `CommitInterval` | 100ms | Commit window; `0` = commit on advance |
+| `PollTimeout` | 100ms | Max block per poll |
+| `RebalanceTimeout` | 3s | Rebalance drain timeout |
+| `Retry` | zero = no retry | Backoff retry policy |
+| `OnDiscard` | nil = fatal | Called after retries exhausted |
+| `KeyExtractor` | nil = use msg.Key | Custom routing key |
 
-## 失败处理
+## Failure Handling
 
 ```
-handler 返回 error
-  ├─ Retry.MaxAttempts > 0 → 泳道内退避重试
-  ├─ 重试耗尽 && OnDiscard != nil → 调 OnDiscard → 跳过，offset 推进
-  └─ 重试耗尽 && OnDiscard == nil → 致命：offset 不提交，Run() 返回错误
+handler returns error
+  ├─ Retry.MaxAttempts > 0 → retry with backoff in-lane
+  ├─ exhausted && OnDiscard != nil → call OnDiscard, skip, advance offset
+  └─ exhausted && OnDiscard == nil → fatal: offset not committed, Run() returns error
 ```
 
-## 接入其他 MQ
+## Supporting Other MQs
 
-实现 `Backend` SPI（`backend.go`）即可：`Poll`/`Commit`/`Pause`/`Resume`/`Subscribe`/`SetRebalanceHandler`。新增 `backend/<mq>/` 目录，core 零改动。
+Implement the `Backend` SPI (`backend.go`): `Poll`/`Commit`/`Pause`/`Resume`/`Subscribe`/`SetRebalanceHandler`. Add a `backend/<mq>/` directory; the core stays untouched.
 
-## 测试
+## Testing
 
 ```bash
-go test ./... -race                                      # 引擎测试（内存 backend，无需 MQ）
+go test ./... -race                                      # engine tests (in-memory backend, no MQ)
 docker compose -f examples/kafka-e2e/docker-compose.yaml up -d
-go run ./examples/kafka-e2e                            # 真实 Kafka 端到端（含断言）
-go run ./bench                                         # 并发基准
+go run ./examples/kafka-e2e                            # real Kafka end-to-end (with assertions)
+go run ./bench                                         # concurrency benchmark
 ```
