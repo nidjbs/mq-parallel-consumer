@@ -30,19 +30,17 @@ Kafka 单 partition 的消费并行度受限于 partition 数，且慢消息会�
 ### 模块划分
 
 ```
-mq-parallel-consumer/       ← 模块根（core，零外部依赖，仅标准库）
+mq-parallel-consumer/       ← 模块根（公开门面，零外部依赖，仅标准库）
 ├── go.mod
-├── message.go                Message / TopicPartition / Offset / Header
-├── backend.go                Backend SPI + RebalanceHandler
-├── config.go                 Config / Mode / RetryPolicy / DefaultConfig
-├── consumer.go               Consumer 引擎：poll 循环 + 编排
-├── partition.go              PartitionWorker（每 partition 一组泳道 / 并发池）
-├── lane.go                   泳道实现
-├── offsettracker.go          最大连续 offset 状态机
-├── retry.go                  重试 + OnDiscard
-├── errors.go                 哨兵错误
+├── message.go                Message / TopicPartition / Offset / Header（转发）
+├── backend.go                Backend SPI + RebalanceHandler（转发）
+├── config.go                 Config / Mode / RetryPolicy / DefaultConfig（转发）
+├── consumer.go               Consumer + New（转发入口）
+├── errors.go / stats.go      （转发）
+├── internal/
+│   └── engine/               ← 实现：Consumer 引擎 / PartitionWorker / lane / offsetTracker / retry，类型真实定义
 └── backend/
-    └── kafka/                ← adapter（依赖 core + franz-go，唯一接触 kafka 的地方）
+    └── kafka/                ← adapter（依赖根包 + franz-go，唯一接触 kafka 的地方）
         ├── backend.go        franz-go 实现 Backend
         ├── config.go         brokers / SASL / group 等 kafka 专属配置
         └── backend_test.go

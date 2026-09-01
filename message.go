@@ -1,34 +1,12 @@
 package swimlane
 
-import "time"
+import engine "mq-parallel-consumer/internal/engine"
 
-// TopicPartition identifies a partition/queue.
-type TopicPartition struct {
-	Topic     string
-	Partition int32
-}
-
-// Offset is a MQ-agnostic position.
-type Offset int64
-
-// Header is a MQ-agnostic message header.
-type Header struct {
-	Key   string
-	Value []byte
-}
-
-// Message is the transport-agnostic record.
-type Message struct {
-	Topic     string
-	Partition int32
-	Offset    Offset
-	Key       []byte
-	Value     []byte
-	Headers   []Header
-	Timestamp time.Time
-}
-
-// TP returns the message's topic-partition.
-func (m *Message) TP() TopicPartition {
-	return TopicPartition{Topic: m.Topic, Partition: m.Partition}
-}
+// Types are re-exported from the engine package; the engine holds the
+// real definitions.
+type (
+	TopicPartition = engine.TopicPartition
+	Offset         = engine.Offset
+	Header         = engine.Header
+	Message        = engine.Message
+)

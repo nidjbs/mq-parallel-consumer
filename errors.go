@@ -1,9 +1,9 @@
 package swimlane
 
-import "errors"
+import engine "mq-parallel-consumer/internal/engine"
 
 var (
-	ErrInvalidConfig = errors.New("swimlane: invalid config")
-	ErrClosed        = errors.New("swimlane: closed")
-	ErrHandlerFatal  = errors.New("swimlane: handler failed")
+	ErrInvalidConfig = engine.ErrInvalidConfig
+	ErrClosed        = engine.ErrClosed
+	ErrHandlerFatal  = engine.ErrHandlerFatal
 )
