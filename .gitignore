@@ -1,0 +1,12 @@
+# Go build artifacts
+*.test
+*.out
+coverage.*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Dependencies
+/vendor/
