@@ -177,6 +177,110 @@ func TestUnorderedMode(t *testing.T) {
 	}
 }
 
+// a failing head that enters cooldown must not stall other keys on the lane:
+// fast key finishes during slow key's backoff.
+func TestCooldownDoesNotBlockOtherKeys(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Lanes = 1
+	cfg.QueueSize = 16
+	cfg.Retry = RetryPolicy{MaxAttempts: 2, InitialBackoff: 50 * time.Millisecond}
+	var slowCalls, fastCalls atomic.Int32
+	var fastDoneAt, slowSecondAt atomic.Int64
+	w := newTestWorker(cfg, func(ctx context.Context, m *Message) error {
+		if string(m.Key) == "slow" {
+			if slowCalls.Add(1) == 1 {
+				return errors.New("transient")
+			}
+			slowSecondAt.Store(time.Now().UnixMilli())
+			return nil
+		}
+		fastCalls.Add(1)
+		fastDoneAt.Store(time.Now().UnixMilli())
+		return nil
+	})
+	w.route(context.Background(), &Message{Key: []byte("slow"), Offset: 0})
+	w.route(context.Background(), &Message{Key: []byte("fast"), Offset: 1})
+	w.drain(context.Background())
+
+	if slowCalls.Load() != 2 || fastCalls.Load() != 1 {
+		t.Fatalf("calls: slow=%d (want 2), fast=%d (want 1)", slowCalls.Load(), fastCalls.Load())
+	}
+	if fastDoneAt.Load() >= slowSecondAt.Load() {
+		t.Fatalf("fast finished %dms after slow's retry: cooldown blocked other keys",
+			slowSecondAt.Load()-fastDoneAt.Load())
+	}
+	if got := w.baseOffset(); got != 2 {
+		t.Fatalf("base = %d, want 2", got)
+	}
+}
+
+// per-key order survives a retry: the next message of the same key runs only
+// after the failed head has been retried to success.
+func TestKeyOrderPreservedAcrossRetry(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Lanes = 1
+	cfg.Retry = RetryPolicy{MaxAttempts: 2, InitialBackoff: 10 * time.Millisecond}
+	var calls0, calls1 atomic.Int32
+	var done0At, done1At atomic.Int64
+	w := newTestWorker(cfg, func(ctx context.Context, m *Message) error {
+		if m.Offset == 0 {
+			if calls0.Add(1) == 1 {
+				return errors.New("transient")
+			}
+			done0At.Store(time.Now().UnixMilli())
+			return nil
+		}
+		calls1.Add(1)
+		done1At.Store(time.Now().UnixMilli())
+		return nil
+	})
+	w.route(context.Background(), &Message{Key: []byte("k"), Offset: 0})
+	w.route(context.Background(), &Message{Key: []byte("k"), Offset: 1})
+	w.drain(context.Background())
+
+	if calls0.Load() != 2 || calls1.Load() != 1 {
+		t.Fatalf("calls: offset0=%d (want 2), offset1=%d (want 1)", calls0.Load(), calls1.Load())
+	}
+	if done1At.Load() < done0At.Load() {
+		t.Fatalf("offset1 ran before offset0's retry finished: per-key order broken")
+	}
+	if got := w.baseOffset(); got != 2 {
+		t.Fatalf("base = %d, want 2", got)
+	}
+}
+
+// highestSeen tracks the furthest routed offset regardless of completion.
+func TestHighestSeenTracked(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Lanes = 3
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	w := newTestWorker(cfg, func(ctx context.Context, m *Message) error {
+		if string(m.Key) == "a" {
+			once.Do(func() { close(started) })
+			<-release // hold offset 0 open
+		}
+		return nil
+	})
+	w.route(context.Background(), &Message{Key: []byte("a"), Offset: 0})
+	<-started // offset 0 in flight; base can never pass the hole at 0
+	w.route(context.Background(), &Message{Key: []byte("b"), Offset: 1})
+	w.route(context.Background(), &Message{Key: []byte("c"), Offset: 2})
+
+	if got := Offset(w.highestSeen.Load()); got != 2 {
+		t.Fatalf("HighestSeen = %d, want 2", got)
+	}
+	if got := w.baseOffset(); got != 0 {
+		t.Fatalf("base = %d, want 0 (hole at 0)", got)
+	}
+	close(release)
+	w.drain(context.Background())
+	if got := w.baseOffset(); got != 3 {
+		t.Fatalf("base after drain = %d, want 3", got)
+	}
+}
+
 // drain is idempotent.
 func TestDrainIdempotent(t *testing.T) {
 	cfg := newTestConfig()

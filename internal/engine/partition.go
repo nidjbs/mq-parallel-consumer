@@ -15,7 +15,17 @@ type workerEnv struct {
 	cancel        context.CancelFunc // cancels the consumer's work ctx on fatal
 	inflightTotal *atomic.Int64
 	counters      *counters
+	advance       func() // notifies the committer that the tracker moved
 }
+
+// workResult is the outcome of a single handler attempt on a message.
+type workResult int
+
+const (
+	workDone  workResult = iota // message finished (success or handled discard)
+	workRetry                   // failed, retry configured; cool the chain head down
+	workStop                    // fatal / shutdown; worker should stop
+)
 
 // partitionWorker owns one partition's lanes and offset tracker.
 type partitionWorker struct {
@@ -28,7 +38,9 @@ type partitionWorker struct {
 	tracker       *offsetTracker
 	inflight      sync.WaitGroup
 	inflightCount atomic.Int64
+	highestSeen   atomic.Int64
 	maxInFlight   int
+	naturalCap    int // in-flight ceiling the route itself enforces (full lanes / semaphore)
 	env           *workerEnv
 	mu            sync.Mutex
 	closed        bool
@@ -47,11 +59,13 @@ func newPartitionWorker(tp TopicPartition, cfg Config, env *workerEnv) *partitio
 	}
 	if cfg.Mode == Unordered {
 		w.sem = make(chan struct{}, cfg.Concurrency)
+		w.naturalCap = cfg.Concurrency
 	} else {
 		w.lanes = make([]*lane, cfg.Lanes)
 		for i := range w.lanes {
 			w.lanes[i] = newLane(i, w, cfg.QueueSize)
 		}
+		w.naturalCap = cfg.Lanes * cfg.QueueSize
 	}
 	return w
 }
@@ -89,6 +103,9 @@ func (w *partitionWorker) route(ctx context.Context, msg *Message) bool {
 	}
 	w.pending[msg.Offset] = struct{}{}
 	w.mu.Unlock()
+	if o := int64(msg.Offset); o > w.highestSeen.Load() {
+		w.highestSeen.Store(o)
+	}
 
 	w.inflight.Add(1)
 	w.inflightCount.Add(1)
@@ -105,33 +122,35 @@ func (w *partitionWorker) route(ctx context.Context, msg *Message) bool {
 			defer w.inflight.Done()
 			defer w.inflightCount.Add(-1)
 			defer w.env.inflightTotal.Add(-1)
-			w.handle(ctx, msg)
+			w.runUnordered(ctx, msg)
 		}()
 		return true
 	}
 
 	idx := w.laneIndex(msg)
-	select {
-	case w.lanes[idx].q <- msg:
-		return true
-	case <-ctx.Done():
+	if !w.lanes[idx].push(ctx, msg) {
+		w.forget(msg.Offset)
 		w.inflight.Done()
 		w.inflightCount.Add(-1)
 		return false
 	}
+	return true
 }
 
-// laneIndex hashes the extracted key to a lane; empty key -> lane 0.
+// keyOf returns the routing key of a message (empty when none).
+func (w *partitionWorker) keyOf(msg *Message) string {
+	if w.cfg.KeyExtractor != nil {
+		return w.cfg.KeyExtractor(msg)
+	}
+	return string(msg.Key)
+}
+
+// laneIndex hashes the routing key to a lane; empty key -> lane 0.
 func (w *partitionWorker) laneIndex(msg *Message) int {
 	if len(w.lanes) <= 1 {
 		return 0
 	}
-	var key string
-	if w.cfg.KeyExtractor != nil {
-		key = w.cfg.KeyExtractor(msg)
-	} else {
-		key = string(msg.Key)
-	}
+	key := w.keyOf(msg)
 	if key == "" {
 		return 0
 	}
@@ -153,7 +172,7 @@ func (w *partitionWorker) drain(ctx context.Context) {
 
 	if w.mode == KeyOrdered {
 		for _, l := range lanes {
-			close(l.q)
+			l.closeLane()
 		}
 	}
 	done := make(chan struct{})
@@ -168,52 +187,79 @@ func (w *partitionWorker) drain(ctx context.Context) {
 	}
 }
 
-// handle processes a message and advances the tracker, or reports fatal.
-func (w *partitionWorker) handle(ctx context.Context, msg *Message) {
-	defer w.forget(msg.Offset)
-	err := w.process(ctx, msg)
-	if err == nil {
-		w.tracker.complete(msg.Offset)
-		return
+// maxAttempts returns how many handler attempts a message may get.
+func (w *partitionWorker) maxAttempts() int {
+	if w.cfg.Retry.MaxAttempts <= 0 {
+		return 1
 	}
-	if ctx.Err() != nil {
-		return // shutdown/drain: leave offset uncommitted
-	}
-	w.env.counters.handlerErrors.Add(1)
-	w.reportFatal(fmt.Errorf("%w: %v", ErrHandlerFatal, err))
+	return w.cfg.Retry.MaxAttempts
 }
 
-// process runs the handler with retry, then OnDiscard if configured.
-func (w *partitionWorker) process(ctx context.Context, msg *Message) error {
-	maxAttempts := w.cfg.Retry.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 1
+// runMessage attempts the handler once and decides the message's next step.
+// Success (or a handled discard) advances the tracker and notifies the
+// committer; a failure within MaxAttempts asks for a cooldown retry; exhaustion
+// without OnDiscard reports fatal.
+func (w *partitionWorker) runMessage(ctx context.Context, wk *work) (workResult, time.Duration) {
+	err := w.safeHandler(ctx, wk.msg)
+	if err == nil {
+		w.env.counters.processed.Add(1)
+		w.tracker.complete(wk.msg.Offset)
+		w.finishOffset(wk.msg.Offset)
+		return workDone, 0
 	}
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		lastErr = w.safeHandler(ctx, msg)
-		if lastErr == nil {
-			w.env.counters.processed.Add(1)
-			return nil
-		}
-		if attempt == maxAttempts-1 {
-			break
-		}
-		backoff := jitteredBackoff(retryBackoff(w.cfg.Retry, attempt))
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if ctx.Err() != nil {
+		w.finishOffset(wk.msg.Offset)
+		return workStop, 0 // shutdown: leave offset uncommitted
+	}
+	if wk.attempts+1 < w.maxAttempts() {
+		return workRetry, jitteredBackoff(retryBackoff(w.cfg.Retry, wk.attempts))
 	}
 	if w.cfg.OnDiscard != nil {
-		if err := w.safeOnDiscard(ctx, msg, lastErr); err != nil {
-			return err
+		if derr := w.safeOnDiscard(ctx, wk.msg, err); derr != nil {
+			w.env.counters.handlerErrors.Add(1)
+			w.finishOffset(wk.msg.Offset)
+			w.reportFatal(fmt.Errorf("%w: %v", ErrHandlerFatal, derr))
+			return workStop, 0
 		}
 		w.env.counters.discarded.Add(1)
-		return nil
+		w.tracker.complete(wk.msg.Offset) // skipped: advance as completed
+		w.finishOffset(wk.msg.Offset)
+		return workDone, 0
 	}
-	return lastErr
+	w.env.counters.handlerErrors.Add(1)
+	w.finishOffset(wk.msg.Offset)
+	w.reportFatal(fmt.Errorf("%w: %v", ErrHandlerFatal, err))
+	return workStop, 0
+}
+
+// runUnordered processes a single message with in-place backoff retries. Each
+// message has its own goroutine, so its retries never block other messages.
+func (w *partitionWorker) runUnordered(ctx context.Context, msg *Message) {
+	wk := &work{msg: msg}
+	for {
+		res, backoff := w.runMessage(ctx, wk)
+		switch res {
+		case workDone, workStop:
+			return
+		case workRetry:
+			wk.attempts++
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				w.finishOffset(msg.Offset)
+				return
+			}
+		}
+	}
+}
+
+// finishOffset clears the pending marker and notifies the committer that the
+// tracker may have advanced.
+func (w *partitionWorker) finishOffset(o Offset) {
+	w.forget(o)
+	if w.env.advance != nil {
+		w.env.advance()
+	}
 }
 
 // safeHandler runs the user handler and converts a panic into an error so a

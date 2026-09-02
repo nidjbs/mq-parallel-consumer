@@ -10,20 +10,24 @@ import (
 )
 
 type Consumer struct {
-	backend    Backend
-	cfg        Config
-	handler    Handler
-	mu         sync.Mutex
-	workers    map[TopicPartition]*partitionWorker
-	paused     map[TopicPartition]bool
-	stopCh     chan struct{}
-	stopOnce   sync.Once
-	workCtx    context.Context
-	workCancel context.CancelFunc
+	backend      Backend
+	cfg          Config
+	handler      Handler
+	mu           sync.Mutex
+	workers      map[TopicPartition]*partitionWorker
+	paused       map[TopicPartition]bool // engine-driven (backpressure) pause state
+	manualPaused map[TopicPartition]bool // Pause()/Resume() driven; exempt from auto-resume
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	workCtx      context.Context
+	workCancel   context.CancelFunc
 
 	runState     atomic.Bool // single-use guard: Run may only be called once
 	rebalanceErr error       // revoke commit failure, surfaced by Run
 	counters     *counters
+
+	commitCh chan struct{} // worker->committer "tracker advanced" signal
+	commitMu sync.Mutex    // serializes all backend.Commit calls
 
 	inflightTotal atomic.Int64
 	fatalCh       chan error
@@ -39,13 +43,15 @@ func New(backend Backend, cfg Config) (*Consumer, error) {
 		return nil, err
 	}
 	return &Consumer{
-		backend:  backend,
-		cfg:      cfg,
-		workers:  make(map[TopicPartition]*partitionWorker),
-		paused:   make(map[TopicPartition]bool),
-		stopCh:   make(chan struct{}),
-		fatalCh:  make(chan error, 1),
-		counters: &counters{},
+		backend:      backend,
+		cfg:          cfg,
+		workers:      make(map[TopicPartition]*partitionWorker),
+		paused:       make(map[TopicPartition]bool),
+		manualPaused: make(map[TopicPartition]bool),
+		stopCh:       make(chan struct{}),
+		fatalCh:      make(chan error, 1),
+		commitCh:     make(chan struct{}, 1),
+		counters:     &counters{},
 	}, nil
 }
 
@@ -76,9 +82,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.backend.SetRebalanceHandler(c)
+	go c.runCommitter(c.workCtx) // commits run off the poll loop
 
-	var lastCommit time.Time
-	first := true
 	for {
 		if rerr := c.takeRebalanceErr(); rerr != nil {
 			return c.shutdown(rerr)
@@ -91,16 +96,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 		case err := <-c.fatalCh:
 			return c.shutdown(err)
 		default:
-		}
-
-		if c.cfg.CommitInterval > 0 {
-			if first || time.Since(lastCommit) >= c.cfg.CommitInterval {
-				c.commitAll(c.workCtx, false)
-				lastCommit = time.Now()
-				first = false
-			}
-		} else {
-			c.commitAll(c.workCtx, true) // commit-on-advance
 		}
 
 		c.applyBackpressure(c.workCtx)
@@ -136,6 +131,65 @@ func (c *Consumer) Stop() {
 	})
 }
 
+// Pause manually stops polling the given partitions (empty = all currently
+// assigned) without unsubscribing. Manual pauses are exempt from automatic
+// backpressure resume and are lifted with Resume. Useful as a circuit breaker
+// when a downstream system is down.
+func (c *Consumer) Pause(parts ...TopicPartition) error {
+	parts = c.resolveManualParts(parts)
+	if len(parts) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	for _, tp := range parts {
+		c.manualPaused[tp] = true
+	}
+	c.mu.Unlock()
+	return c.backend.Pause(parts)
+}
+
+// Resume lifts a manual pause started by Pause (empty = all paused partitions).
+func (c *Consumer) Resume(parts ...TopicPartition) error {
+	parts = c.resolvePausedParts(parts)
+	if len(parts) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	for _, tp := range parts {
+		delete(c.manualPaused, tp)
+	}
+	c.mu.Unlock()
+	return c.backend.Resume(parts)
+}
+
+// resolveManualParts expands an empty partition list to all assigned partitions.
+func (c *Consumer) resolveManualParts(parts []TopicPartition) []TopicPartition {
+	if len(parts) > 0 {
+		return parts
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]TopicPartition, 0, len(c.workers))
+	for tp := range c.workers {
+		out = append(out, tp)
+	}
+	return out
+}
+
+// resolvePausedParts expands an empty partition list to all manually paused ones.
+func (c *Consumer) resolvePausedParts(parts []TopicPartition) []TopicPartition {
+	if len(parts) > 0 {
+		return parts
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]TopicPartition, 0, len(c.manualPaused))
+	for tp := range c.manualPaused {
+		out = append(out, tp)
+	}
+	return out
+}
+
 // Stats returns a snapshot of the consumer state.
 func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
@@ -155,6 +209,7 @@ func (c *Consumer) Stats() Stats {
 		s.PerPartition[tp] = PartitionStat{
 			InFlight:    w.inFlight(),
 			BaseOffset:  w.baseOffset(),
+			HighestSeen: Offset(w.highestSeen.Load()),
 			MaxInFlight: w.maxInFlight,
 		}
 	}
@@ -175,6 +230,7 @@ func (c *Consumer) OnAssigned(ctx context.Context, assigned map[TopicPartition]O
 			cancel:        c.workCancel,
 			inflightTotal: &c.inflightTotal,
 			counters:      c.counters,
+			advance:       c.signalAdvance,
 		})
 		w.setHandler(c.handler)
 		w.start(c.workCtx)
@@ -187,7 +243,8 @@ func (c *Consumer) OnRevoked(ctx context.Context, revoked []TopicPartition) erro
 	c.mu.Lock()
 	victims := make([]*partitionWorker, 0, len(revoked))
 	for _, tp := range revoked {
-		delete(c.paused, tp) // stale pause bookkeeping from an earlier assignment
+		delete(c.paused, tp)       // stale auto-pause bookkeeping
+		delete(c.manualPaused, tp) // stale manual-pause bookkeeping
 		if w, ok := c.workers[tp]; ok {
 			victims = append(victims, w)
 			delete(c.workers, tp)
@@ -216,7 +273,10 @@ func (c *Consumer) OnRevoked(ctx context.Context, revoked []TopicPartition) erro
 	}
 	commitCtx, commitCancel := context.WithTimeout(ctx, c.cfg.RebalanceTimeout)
 	defer commitCancel()
-	if err := c.backend.Commit(commitCtx, commits); err != nil {
+	c.commitMu.Lock()
+	err := c.backend.Commit(commitCtx, commits)
+	c.commitMu.Unlock()
+	if err != nil {
 		c.mu.Lock()
 		if c.rebalanceErr == nil {
 			c.rebalanceErr = err
@@ -262,7 +322,10 @@ func (c *Consumer) commitAll(ctx context.Context, advanceOnly bool) {
 		return
 	}
 	c.counters.commits.Add(1)
-	if err := c.backend.Commit(ctx, commits); err != nil {
+	c.commitMu.Lock()
+	err := c.backend.Commit(ctx, commits)
+	c.commitMu.Unlock()
+	if err != nil {
 		c.counters.commitErrors.Add(1)
 		return
 	}
@@ -284,10 +347,58 @@ func (c *Consumer) takeRebalanceErr() error {
 	return err
 }
 
+// runCommitter owns all offset commits off the poll loop, so a slow broker
+// commit cannot stall polling. With CommitInterval > 0 it commits on a timer
+// (an initial commit preserves the old "commit right away" behavior); with
+// CommitInterval = 0 it commits only when a worker signals that the contiguous
+// base advanced.
+func (c *Consumer) runCommitter(ctx context.Context) {
+	var tick <-chan time.Time
+	if c.cfg.CommitInterval > 0 {
+		t := time.NewTicker(c.cfg.CommitInterval)
+		defer t.Stop()
+		tick = t.C
+		c.commitAll(ctx, false)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case <-c.commitCh:
+			if c.cfg.CommitInterval <= 0 {
+				c.commitAll(ctx, true) // commit-on-advance
+			}
+		case <-tick:
+			c.commitAll(ctx, false)
+		}
+	}
+}
+
+// signalAdvance wakes the committer; non-blocking so workers never stall on it.
+func (c *Consumer) signalAdvance() {
+	select {
+	case c.commitCh <- struct{}{}:
+	default:
+	}
+}
+
 func (c *Consumer) applyBackpressure(ctx context.Context) {
 	c.mu.Lock()
 	var pause, resume []TopicPartition
 	for tp, w := range c.workers {
+		if c.manualPaused[tp] {
+			continue // Pause()/Resume() owns this partition; auto logic stays away
+		}
+		// When MaxInFlight equals the route's natural ceiling (full lane
+		// buffers / concurrency semaphore), routing already blocks the poll
+		// loop — pausing on top of it only stalls an otherwise-idle poll until
+		// PollTimeout. Broker-side pause is meaningful only when MaxInFlight
+		// leaves headroom beyond that ceiling.
+		if w.maxInFlight == w.naturalCap {
+			continue
+		}
 		n := w.inFlight()
 		if n >= int64(w.maxInFlight) && !c.paused[tp] {
 			pause = append(pause, tp)
@@ -340,7 +451,10 @@ func (c *Consumer) shutdown(finalErr error) error {
 		// fresh budget: a slow drain must not expire the final commit's context
 		commitCtx, commitCancel := context.WithTimeout(context.Background(), c.cfg.RebalanceTimeout)
 		defer commitCancel()
-		if err := c.backend.Commit(commitCtx, commits); err != nil && finalErr == nil {
+		c.commitMu.Lock()
+		err := c.backend.Commit(commitCtx, commits)
+		c.commitMu.Unlock()
+		if err != nil && finalErr == nil {
 			finalErr = err
 		}
 	}

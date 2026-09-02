@@ -14,7 +14,8 @@ type counters struct {
 // PartitionStat is a snapshot of one partition's worker.
 type PartitionStat struct {
 	InFlight    int64
-	BaseOffset  Offset
+	BaseOffset  Offset // highest contiguous completed + 1
+	HighestSeen Offset // highest offset routed to this partition
 	MaxInFlight int
 }
 

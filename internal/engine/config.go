@@ -10,7 +10,16 @@ import (
 // Handler processes a single message. It runs on worker goroutines.
 type Handler func(ctx context.Context, msg *Message) error
 
-// RetryPolicy controls in-lane retries. Zero value means no retry.
+// RetryPolicy controls in-process retries of a failing message.
+//
+// Zero value (the default) means no retry: a message is attempted once and, on
+// failure, goes straight to OnDiscard (or fatal when OnDiscard is nil). When
+// enabled, failed messages are cooled down out of their lane so they do not
+// block unrelated keys, and retried up to MaxAttempts.
+//
+// Recommended production pattern: leave retry disabled and use OnDiscard to
+// hand the message to an MQ-level retry mechanism (DLQ / retry topic), which
+// replays it independently of the main consumption path.
 type RetryPolicy struct {
 	MaxAttempts    int
 	InitialBackoff time.Duration
@@ -19,11 +28,16 @@ type RetryPolicy struct {
 
 // Config is fully configurable; every field has zero-value semantics.
 type Config struct {
-	Mode             Mode
-	Lanes            int           // KeyOrdered: lanes per partition
-	Concurrency      int           // Unordered: per-partition concurrency; the hard in-flight cap in this mode
-	MaxInFlight      int           // per-partition in-flight soft target that triggers pause; 0 = derived. Hard memory bounds are the bounded lane queues (Lanes x QueueSize) in KeyOrdered and the Concurrency semaphore in Unordered.
-	QueueSize        int           // per-lane bounded queue depth
+	Mode        Mode
+	Lanes       int // KeyOrdered: lanes per partition
+	Concurrency int // Unordered: per-partition concurrency; the hard in-flight cap in this mode
+	// MaxInFlight is the per-partition in-flight ceiling. When it equals the
+	// route's natural ceiling (bounded lane queues Lanes x QueueSize in
+	// KeyOrdered, the Concurrency semaphore in Unordered) the bounded queues
+	// themselves provide backpressure and no broker pause is issued. Setting it
+	// lower pauses earlier; higher leaves headroom buffered before pausing.
+	MaxInFlight      int
+	QueueSize        int           // per-lane bound on total buffered messages (all keys of a lane share it)
 	CommitInterval   time.Duration // 0 = commit immediately when the contiguous base advances
 	PollTimeout      time.Duration
 	RebalanceTimeout time.Duration

@@ -516,6 +516,165 @@ func TestIdlePollDeadlineKeepsRunning(t *testing.T) {
 	}
 }
 
+// Pause/Resume basics: empty list = all assigned; Resume records a transport
+// resume.
+func TestPauseResumeBasics(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		h := be.h
+		be.mu.Unlock()
+		if h != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := c.Pause(); err != nil { // empty = all assigned
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	_, mp := c.manualPaused[tp]
+	c.mu.Unlock()
+	if !mp {
+		t.Fatal("Pause() did not mark partition manually paused")
+	}
+	be.mu.Lock()
+	paused := be.paused[tp]
+	be.mu.Unlock()
+	if !paused {
+		t.Fatal("Pause() did not pause the transport")
+	}
+	if err := c.Resume(tp); err != nil {
+		t.Fatal(err)
+	}
+	be.mu.Lock()
+	resumed := false
+	for _, p := range be.resumeCalls {
+		if p == tp {
+			resumed = true
+		}
+	}
+	be.mu.Unlock()
+	if !resumed {
+		t.Fatal("Resume() did not resume the transport")
+	}
+	c.Stop()
+}
+
+// a manually paused partition is shielded from automatic backpressure resume
+// until the user calls Resume.
+func TestManualPauseExemptFromAutoResume(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	handler := func(ctx context.Context, m *Message) error {
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	}
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	cfg.MaxInFlight = 1
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	<-started // one message in flight: engine should auto-pause at MaxInFlight=1
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		paused := be.paused[tp]
+		be.mu.Unlock()
+		if paused {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := c.Pause(tp); err != nil {
+		t.Fatal(err)
+	}
+	close(release)                     // in-flight drops to 0; auto logic would normally resume
+	time.Sleep(150 * time.Millisecond) // give a few poll/backpressure cycles
+	be.mu.Lock()
+	paused := be.paused[tp]
+	be.mu.Unlock()
+	if !paused {
+		t.Fatal("auto backpressure resumed a manually paused partition")
+	}
+	if err := c.Resume(tp); err != nil {
+		t.Fatal(err)
+	}
+	c.Stop()
+}
+
+// revoke clears manual-pause bookkeeping.
+func TestManualPauseClearedOnRevoke(t *testing.T) {
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
+	cfg := DefaultConfig()
+	cfg.Lanes = 1
+	handler := func(ctx context.Context, m *Message) error { return nil }
+	c, err := New(be, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Subscribe([]string{"t"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	go c.Run(ctx)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		be.mu.Lock()
+		h := be.h
+		be.mu.Unlock()
+		if h != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	be.mu.Lock()
+	h := be.h
+	be.mu.Unlock()
+	if h == nil {
+		t.Fatal("rebalance handler not registered")
+	}
+	c.mu.Lock()
+	c.manualPaused[tp] = true
+	c.mu.Unlock()
+	if err := h.OnRevoked(context.Background(), []TopicPartition{tp}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	_, mp := c.manualPaused[tp]
+	c.mu.Unlock()
+	if mp {
+		t.Fatal("manual pause bookkeeping not cleared on revoke")
+	}
+	c.Stop()
+}
+
 // Stats counters reflect processed messages and commit attempts.
 func TestStatsCounters(t *testing.T) {
 	be := newFakeBackend(Message{Topic: "t", Partition: 0, Offset: 0})
